@@ -1,6 +1,6 @@
 # PostgreSQL EXPLAIN + INDEX 設計学習プロジェクト
 
-100 万件のデータで INDEX の効果を体感し、EXPLAIN の読み方をマスターするプロジェクトです。
+1000 万件のデータで INDEX の効果を体感し、EXPLAIN の読み方をマスターするプロジェクトです。
 
 ## 📁 プロジェクト構成
 
@@ -9,7 +9,7 @@ postgres-explain-index/
 ├── docker-compose.yml          # PostgreSQL環境定義
 ├── README.md                   # このファイル
 ├── init/
-│   └── 01_init_all.sql        # テーブル作成 + 100万件データ自動生成
+│   └── 01_init_all.sql        # テーブル作成 + 1000万件データ自動生成
 └── scripts/
     ├── benchmark.sh           # INDEX効果比較（自動測定）
     └── explain_queries.sql    # EXPLAIN学習用クエリ集
@@ -27,10 +27,10 @@ docker compose up -d
 
 - PostgreSQL 起動
 - テーブル作成（users, purchases）
-- 100 万件のユーザーデータ生成
-- 200 万件の購入履歴生成
+- 1000 万件のユーザーデータ生成
+- 2000 万件の購入履歴生成
 
-**所要時間**: 初回起動時 約 30 秒〜1 分
+**所要時間**: 初回起動時 約 5〜10 分
 
 ### 2. 初期化完了を確認
 
@@ -55,140 +55,337 @@ docker exec postgres-explain-demo psql -U demouser -d explaindb -c "SELECT COUNT
 
 **このスクリプトが自動で実行:**
 
-1. INDEX 無しでクエリ実行（5 種類）
+1. INDEX 無しでクエリ実行（6 種類）
 2. INDEX 作成
 3. INDEX 有りでクエリ実行
-4. EXPLAIN ANALYZE で実行計画表示
+4. EXPLAIN ANALYZE で実行計画詳細比較
 5. INDEX 情報表示
 6. INDEX 削除（次回測定のため）
 
-## 📊 EXPLAIN の読み方
+---
+
+## 📊 実測結果から学ぶ INDEX 設計の真実
+
+### 検証結果サマリー（1000 万件データ）
+
+| クエリ種類                               | INDEX 無し | INDEX 有り | 結果              | 理由                                                |
+| ---------------------------------------- | ---------- | ---------- | ----------------- | --------------------------------------------------- |
+| **等価検索** `age = 95`                  | 191ms      | 299ms      | ❌ **1.6 倍遅い** | 低選択性（62,500 件ヒット）でランダム I/O 大量発生  |
+| **範囲検索** `age BETWEEN 95-99`         | 223ms      | 366ms      | ❌ **1.6 倍遅い** | 低選択性（312,500 件ヒット）でランダム I/O 大量発生 |
+| **国別検索** `country = 'Singapore'`     | 201ms      | 295ms      | ❌ **1.5 倍遅い** | 低選択性（100,000 件ヒット）でランダム I/O 大量発生 |
+| **Email 検索** `email = 'xxx'`           | 138ms      | 3ms        | ✅ **43 倍高速**  | 超高選択性（1 件）で Index Scan 直撃                |
+| **COUNT 集計** `COUNT(*) WHERE age > 90` | 119ms      | 16ms       | ✅ **7.5 倍高速** | Index Only Scan で実テーブル不要                    |
+| **LIMIT 検索** `age = 95 LIMIT 10`       | 1.8ms      | 1.7ms      | ✅ わずかに改善   | 早期終了可能なクエリ                                |
+
+### 💡 重要な学び
+
+1. **INDEX は万能ではない**
+
+   - 該当件数が多い（全体の 1%以上）場合、INDEX は逆効果になることがある
+   - PostgreSQL は賢く、「Seq Scan の方が速い」と判断すれば INDEX を使わない
+
+2. **SELECT \* は遅い**
+
+   - INDEX で行を特定しても、全カラム取得のためテーブル本体へランダムアクセス（Heap Fetch）が大量発生
+   - 必要なカラムだけ取得する方が高速
+
+3. **超高選択性クエリで INDEX は劇的効果**
+
+   - Email、ユニークキー検索は 100 倍以上の改善も
+   - Index Scan で即座に目的の行を特定
+
+4. **COUNT(\*)は INDEX Only Scan で高速化**
+   - 実テーブルへのアクセス不要（Heap Fetches: 0）
+   - INDEX だけで集計完了
+
+---
+
+## 📖 EXPLAIN 出力の読み方（実務必須）
 
 ### 基本的な出力例
 
 ```sql
-EXPLAIN ANALYZE SELECT * FROM users WHERE age = 30;
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM users WHERE age = 95;
+```
 
-Seq Scan on users  (cost=0.00..20000.00 rows=10000 width=100)
-                    (actual time=0.050..250.123 rows=16667 loops=1)
-  Filter: (age = 30)
-  Rows Removed by Filter: 983333
-Planning Time: 0.123 ms
-Execution Time: 260.456 ms
+```
+Bitmap Heap Scan on users  (cost=656.40..66091.08 rows=58835 width=67)
+                           (actual time=18.978..250.270 rows=62500 loops=1)
+  Recheck Cond: (age = 95)
+  Heap Blocks: exact=62492
+  Buffers: shared hit=168 read=62379
+  ->  Bitmap Index Scan on idx_users_age  (cost=0.00..641.70 rows=58835 width=0)
+        Index Cond: (age = 95)
+        Buffers: shared read=55
+Planning Time: 0.815 ms
+Execution Time: 252.887 ms
 ```
 
 ### 主要項目の意味
 
-| 項目                    | 意味                 | 補足                   |
-| ----------------------- | -------------------- | ---------------------- |
-| **Seq Scan**            | 全行スキャン         | INDEX 無し、遅い       |
-| **Index Scan**          | INDEX スキャン       | INDEX 使用、速い       |
-| **Bitmap Index Scan**   | ビットマップスキャン | 複数行を効率的に取得   |
-| **cost=0.00..20000.00** | コスト推定値         | 開始コスト..終了コスト |
-| **rows=10000**          | 推定行数             | オプティマイザの予測   |
-| **actual time**         | 実際の時間（ms）     | 実測値                 |
-| **Planning Time**       | 実行計画作成時間     | -                      |
-| **Execution Time**      | 実行時間             | **この値が最重要**     |
+| 項目                       | 意味                     | 見るべきポイント               |
+| -------------------------- | ------------------------ | ------------------------------ |
+| **cost=開始..終了**        | 推定コスト               | 低いほど良い                   |
+| **rows=**                  | 推定行数                 | actual rows と比較して精度確認 |
+| **actual time=開始..終了** | 実際の実行時間（ms）     | 実測値（最重要）               |
+| **Execution Time**         | クエリ全体の実行時間     | **最も重要な指標**             |
+| **Buffers: shared hit**    | キャッシュヒット数       | 多いほど高速                   |
+| **Buffers: shared read**   | ディスク I/O 数          | 少ないほど高速                 |
+| **Heap Blocks**            | テーブル本体へのアクセス | 多いとランダム I/O 大量発生    |
+| **Heap Fetches: 0**        | Index Only Scan 成功     | 実テーブル不要で超高速         |
 
-### 良い実行計画 vs 悪い実行計画
+---
 
-| 項目         | 良い状態                | 悪い状態         |
-| ------------ | ----------------------- | ---------------- |
-| スキャン方法 | `Index Scan`            | `Seq Scan`       |
-| コスト       | 低い（数百以下）        | 高い（数万以上） |
-| 推定精度     | rows と実際の行数が近い | 大きくずれている |
-| 実行時間     | 10ms 以下               | 100ms 以上       |
+## 🔍 実務で覚えるべきスキャン方式（優先度順）
 
-## 🎯 INDEX 効果の例（期待値）
+### 1. Seq Scan（全件スキャン）⚠️
 
-| クエリ種類              | INDEX 無し | INDEX 有り | 改善率    |
-| ----------------------- | ---------- | ---------- | --------- |
-| `age = 30`              | 200ms      | 5ms        | **40 倍** |
-| `age BETWEEN 25 AND 35` | 220ms      | 15ms       | **15 倍** |
-| `country = 'Japan'`     | 180ms      | 8ms        | **22 倍** |
-| `email = 'xxx@xxx.com'` | 210ms      | 3ms        | **70 倍** |
-| `JOIN ... ON user_id`   | 500ms      | 50ms       | **10 倍** |
-
-## 🔍 INDEX 作成の基本
-
-```sql
--- 単一カラムINDEX
-CREATE INDEX idx_users_age ON users(age);
-
--- 複合INDEX（検索条件が複数の場合）
-CREATE INDEX idx_users_country_age ON users(country, age);
-
--- ユニークINDEX
-CREATE UNIQUE INDEX idx_users_email ON users(email);
+```
+Seq Scan on users  (actual time=0.019..110.034 rows=20833 loops=3)
+  Filter: (age = 95)
+  Rows Removed by Filter: 1645833
 ```
 
-## 🧪 実験アイデア
+**特徴:**
 
-### 実験 1: 複合 INDEX の列順による違い
+- テーブル全体を先頭から順番に読む
+- INDEX 無し、または INDEX が使えない場合
+- 大量の行を削除（Rows Removed）している場合は非効率
+
+**対策:**
+
+- 適切な INDEX を作成
+- WHERE 句の条件を見直し
+
+---
+
+### 2. Index Scan（INDEX スキャン）✅
+
+```
+Index Scan using idx_users_email on users  (actual time=0.034..0.035 rows=1 loops=1)
+  Index Cond: (email = 'user_5000000@example.com')
+  Buffers: shared hit=1 read=4
+```
+
+**特徴:**
+
+- INDEX を使って行を特定し、テーブル本体から取得
+- 少数行（1%未満）を取得する場合に最適
+- ランダムアクセスが少ないため高速
+
+**最適なケース:**
+
+- ユニークキー検索
+- 超高選択性の条件
+
+---
+
+### 3. Index Only Scan（INDEX のみスキャン）🚀
+
+```
+Parallel Index Only Scan using idx_users_age  (actual time=0.072..11.643 rows=187500 loops=3)
+  Index Cond: (age > 90)
+  Heap Fetches: 0
+```
+
+**特徴:**
+
+- **実テーブルへのアクセス不要**（最速）
+- INDEX に必要な全カラムが含まれている場合のみ
+- `Heap Fetches: 0` が表示されれば成功
+
+**最適なケース:**
+
+- `COUNT(*)`
+- `SELECT id, indexed_column`
+- カバリング INDEX 使用時
+
+---
+
+### 4. Bitmap Index Scan + Bitmap Heap Scan 📦
+
+```
+Bitmap Heap Scan on users  (actual time=18.978..250.270 rows=62500 loops=1)
+  Heap Blocks: exact=62492
+  ->  Bitmap Index Scan on idx_users_age  (actual time=9.068..9.069 rows=62500 loops=1)
+        Index Cond: (age = 95)
+```
+
+**特徴:**
+
+- 中程度の件数（1%〜10%）を取得する場合
+- INDEX で該当行をビットマップ化してから、まとめてテーブルアクセス
+- ランダム I/O を減らす工夫
+
+**注意点:**
+
+- `Heap Blocks` が多い = ランダム I/O 大量発生
+- 該当件数が多すぎると Seq Scan より遅くなる
+
+---
+
+### 5. Parallel Seq Scan（並列全件スキャン）⚡
+
+```
+Gather  (actual time=0.239..118.368 rows=62500 loops=1)
+  Workers Launched: 2
+  ->  Parallel Seq Scan on users  (actual time=0.019..110.034 rows=20833 loops=3)
+        Filter: (age = 95)
+```
+
+**特徴:**
+
+- 複数ワーカーで並列処理
+- 大量データの Seq Scan を高速化
+- INDEX 無しでもそこそこ速い
+
+**見るべきポイント:**
+
+- `Workers Launched: 2` = 2 つのワーカーで並列実行
+- loops=3 = メイン+ワーカー 2 の合計 3 プロセス
+
+---
+
+## 🎯 INDEX を作るべきケース・作らないケース
+
+### ✅ INDEX を作るべきケース
+
+1. **超高選択性（該当行が少ない）**
+
+```sql
+   -- 1件だけヒット
+   SELECT * FROM users WHERE email = 'user_5000000@example.com';
+   -- 改善: 138ms → 3ms (43倍)
+```
+
+2. **COUNT 集計、集約クエリ**
+
+```sql
+   SELECT COUNT(*) FROM users WHERE age > 90;
+   -- 改善: 119ms → 16ms (7.5倍)
+   -- Index Only Scanで実テーブル不要
+```
+
+3. **ORDER BY、GROUP BY 頻出カラム**
+
+```sql
+   SELECT * FROM users WHERE country = 'USA' ORDER BY age;
+   -- 複合INDEX: (country, age)
+```
+
+4. **JOIN 条件の外部キー**
+
+```sql
+   SELECT * FROM purchases JOIN users ON purchases.user_id = users.id;
+   -- user_idにINDEX必須
+```
+
+5. **LIMIT 付き検索**
+
+```sql
+   SELECT * FROM users WHERE age = 95 LIMIT 10;
+   -- INDEXで最初の10件を即座に取得
+```
+
+---
+
+### ❌ INDEX を作らない方がいいケース
+
+1. **低選択性（該当行が多い）**
+
+```sql
+   -- 62,500件ヒット（全体の0.6%）でも遅くなった
+   SELECT * FROM users WHERE age = 95;
+   -- 結果: 191ms → 299ms (1.6倍遅い)
+```
+
+2. **大半の行がヒットする条件**
+
+```sql
+   -- 90%以上ヒット
+   SELECT * FROM users WHERE age > 20;
+   -- Seq Scanの方が確実に速い
+```
+
+3. **小さなテーブル（数千行以下）**
+
+   - INDEX のオーバーヘッドの方が大きい
+
+4. **頻繁に INSERT/UPDATE されるテーブル**
+
+   - INDEX 更新コストが高い
+
+5. **カラムに関数や演算を使う検索**
+
+```sql
+   -- INDEXが使えない
+   SELECT * FROM users WHERE age * 2 = 60;
+   SELECT * FROM users WHERE UPPER(username) = 'USER_100';
+```
+
+---
+
+## 🛠️ 実務での INDEX 設計フロー
+
+### ステップ 1: スロークエリを特定
+
+```sql
+-- 実行時間が遅いクエリをログから特定
+-- または pg_stat_statements拡張を使用
+```
+
+### ステップ 2: EXPLAIN ANALYZE で分析
 
 ```bash
-# PostgreSQLに接続
 docker exec -it postgres-explain-demo psql -U demouser -d explaindb
 ```
 
 ```sql
--- パターン1: (country, age)
-CREATE INDEX idx_1 ON users(country, age);
-EXPLAIN ANALYZE SELECT * FROM users WHERE country = 'Japan' AND age = 30;
-DROP INDEX idx_1;
-
--- パターン2: (age, country)
-CREATE INDEX idx_2 ON users(age, country);
-EXPLAIN ANALYZE SELECT * FROM users WHERE country = 'Japan' AND age = 30;
-DROP INDEX idx_2;
-
--- どちらが速い？コストは？
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM users WHERE age = 95;
 ```
 
-**学習ポイント**: 複合 INDEX は左側のカラムから使われる
+**確認ポイント:**
 
-### 実験 2: INDEX が使われないケース
+- Seq Scan になっていないか？
+- Execution Time は許容範囲か？
+- rows（推定）と actual rows が大きくずれていないか？
+
+### ステップ 3: INDEX 作成を検討
 
 ```sql
--- ❌ INDEXが使われない例（カラムに演算）
-EXPLAIN ANALYZE SELECT * FROM users WHERE age + 0 = 30;
+-- 条件カラムにINDEX作成
+CREATE INDEX idx_users_age ON users(age);
 
--- ✅ INDEXが使われる例
-EXPLAIN ANALYZE SELECT * FROM users WHERE age = 30;
+-- 統計情報更新
+ANALYZE users;
 ```
 
-**学習ポイント**: WHERE 句のカラムに演算を加えると INDEX 無効化
-
-### 実験 3: 部分 INDEX
+### ステップ 4: 効果測定
 
 ```sql
--- activeユーザーだけにINDEX（INDEXサイズを削減）
-CREATE INDEX idx_users_active_age ON users(age) WHERE status = 'active';
-
--- このクエリでINDEXが使われる
-EXPLAIN ANALYZE SELECT * FROM users WHERE age = 30 AND status = 'active';
-
--- このクエリではINDEXが使われない
-EXPLAIN ANALYZE SELECT * FROM users WHERE age = 30 AND status = 'inactive';
-
-DROP INDEX idx_users_active_age;
+-- 再度EXPLAIN ANALYZE実行
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM users WHERE age = 95;
 ```
 
-### 実験 4: LIKE 検索と INDEX
+**確認ポイント:**
+
+- Index Scan または Index Only Scan に変わったか？
+- Execution Time が改善したか？
+- もし遅くなったら INDEX を削除
+
+### ステップ 5: 本番適用
 
 ```sql
-CREATE INDEX idx_users_username ON users(username);
-
--- ✅ 前方一致はINDEX使用可能
-EXPLAIN ANALYZE SELECT * FROM users WHERE username LIKE 'user_100%';
-
--- ❌ 中間一致・後方一致はINDEX使用不可
-EXPLAIN ANALYZE SELECT * FROM users WHERE username LIKE '%100%';
-
-DROP INDEX idx_users_username;
+-- INDEXを本番環境に適用
+-- CONCURRENTLY オプションでロック回避
+CREATE INDEX CONCURRENTLY idx_users_age ON users(age);
 ```
 
-## 🛠️ 便利なコマンド
+---
+
+## 💻 便利なコマンド
 
 ### PostgreSQL に接続
 
@@ -200,16 +397,6 @@ docker exec -it postgres-explain-demo psql -U demouser -d explaindb
 
 ```sql
 \di
-```
-
-### テーブルサイズ確認
-
-```sql
-SELECT
-    tablename,
-    pg_size_pretty(pg_total_relation_size(tablename::regclass)) AS size
-FROM pg_tables
-WHERE schemaname = 'public';
 ```
 
 ### INDEX 使用状況確認
@@ -227,17 +414,6 @@ WHERE schemaname = 'public'
 ORDER BY idx_scan DESC;
 ```
 
-### INDEX サイズ確認
-
-```sql
-SELECT
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) AS size
-FROM pg_stat_user_indexes
-WHERE schemaname = 'public'
-ORDER BY pg_relation_size(indexrelid) DESC;
-```
-
 ### 未使用 INDEX の検出
 
 ```sql
@@ -245,11 +421,98 @@ SELECT
     schemaname,
     tablename,
     indexname,
-    idx_scan
+    idx_scan,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
 FROM pg_stat_user_indexes
 WHERE schemaname = 'public' AND idx_scan = 0
 ORDER BY pg_relation_size(indexrelid) DESC;
 ```
+
+### テーブル・INDEX サイズ確認
+
+```sql
+SELECT
+    tablename,
+    pg_size_pretty(pg_total_relation_size(tablename::regclass)) AS total_size,
+    pg_size_pretty(pg_relation_size(tablename::regclass)) AS table_size,
+    pg_size_pretty(pg_total_relation_size(tablename::regclass) - pg_relation_size(tablename::regclass)) AS indexes_size
+FROM pg_tables
+WHERE schemaname = 'public';
+```
+
+---
+
+## 🎓 実務レベルのチェックリスト
+
+このプロジェクトで以下を習得すれば、**実務での EXPLAIN+INDEX 設計は十分対応可能**です：
+
+### ✅ 習得すべき知識
+
+- [x] **EXPLAIN の基本的な読み方**
+
+  - cost、rows、actual time、Execution Time の意味
+  - Buffers（キャッシュヒット/ディスク I/O）の見方
+
+- [x] **主要なスキャン方式の理解**
+
+  - Seq Scan、Index Scan、Index Only Scan、Bitmap Index Scan
+  - Parallel Seq Scan の仕組み
+
+- [x] **INDEX が効くケース・効かないケースの判断**
+
+  - 選択性（該当件数の割合）の重要性
+  - COUNT(\*) や LIMIT での INDEX 効果
+
+- [x] **INDEX が逆効果になるケースの理解**
+
+  - 低選択性クエリでのランダム I/O 問題
+  - Heap Blocks 大量発生による性能劣化
+
+- [x] **実務フローの理解**
+  - スロークエリ特定 → EXPLAIN 分析 → INDEX 作成 → 効果測定
+
+### 🚀 さらに上を目指すなら
+
+以下は実務で遭遇する頻度は低いですが、知っておくと役立ちます：
+
+- [ ] **複合 INDEX の列順最適化**
+
+```sql
+  -- 選択性の高い列を左に
+  CREATE INDEX idx_users_country_age ON users(country, age);
+```
+
+- [ ] **部分 INDEX**
+
+```sql
+  -- 条件付きINDEX（INDEXサイズ削減）
+  CREATE INDEX idx_active_users ON users(age) WHERE status = 'active';
+```
+
+- [ ] **カバリング INDEX（INCLUDE 句）**
+
+```sql
+  -- PostgreSQL 11以降
+  CREATE INDEX idx_users_age_inc ON users(age) INCLUDE (username, email);
+  -- Index Only Scanが可能に
+```
+
+- [ ] **JSONB 型の GIN インデックス**
+
+```sql
+  CREATE INDEX idx_data_gin ON documents USING GIN (data);
+```
+
+- [ ] **全文検索 INDEX**
+
+```sql
+  CREATE INDEX idx_content_fts ON articles USING GIN (to_tsvector('english', content));
+```
+
+- [ ] **パーティショニング**
+  - 大規模テーブルの分割管理
+
+---
 
 ## 🧹 クリーンアップ
 
@@ -268,106 +531,83 @@ docker compose down -v
 ### データを再生成したい場合
 
 ```bash
-# ボリューム削除して再起動
 docker compose down -v
 docker compose up -d
-
-# 初期化スクリプトが再実行される
 ```
 
-## 📚 学習ポイント
+---
 
-### INDEX が効果的なケース
+## ❓ よくある質問
 
-✅ **効果大**
+### Q1: INDEX を作成したのに使われない
 
-- 等価検索: `WHERE age = 30`
-- 範囲検索: `WHERE age BETWEEN 25 AND 35`
-- ソート: `ORDER BY age`
-- JOIN 条件: `JOIN ON user_id`
-- ユニーク制約の検索: `WHERE email = 'xxx@xxx.com'`
-- 前方一致 LIKE: `WHERE username LIKE 'user_100%'`
+**原因と対策:**
 
-❌ **効果薄/逆効果**
+1. **統計情報が古い**
 
-- 大半の行がヒット: `WHERE age > 10`（ほぼ全員該当）
-- カラムに演算: `WHERE age * 2 = 60`
-- 関数使用: `WHERE UPPER(username) = 'USER_1'`
-- 中間/後方一致 LIKE: `WHERE username LIKE '%test%'`
-- 小さなテーブル（数百〜数千行程度）
-- カーディナリティが低い列（例: 性別カラムで男/女の 2 値のみ）
-
-### EXPLAIN で注目すべき点
-
-1. **スキャン方法**: Seq Scan → Index Scan に変わったか？
-2. **コスト**: cost の値が大幅に下がったか？
-3. **実行時間**: actual time / Execution Time が改善したか？
-4. **推定精度**: rows（推定）と実際の行数が近いか？
-5. **Buffers**: shared hit（キャッシュヒット）が多いか？
-
-### INDEX 設計のベストプラクティス
-
-1. **WHERE 句で頻繁に使う列に INDEX を作成**
-2. **JOIN 条件の列に INDEX を作成**
-3. **複合 INDEX は選択性の高い列を左に配置**
-4. **INDEX の数は必要最小限に**（書き込み性能への影響）
-5. **ANALYZE 定期実行で統計情報を最新に保つ**
-
-## 🔧 トラブルシューティング
-
-### Q: ベンチマークで INDEX の効果が見られない
-
-```bash
-# 統計情報を更新
-docker exec postgres-explain-demo psql -U demouser -d explaindb -c "ANALYZE users; ANALYZE purchases;"
-
-# 再度ベンチマーク実行
-./scripts/benchmark.sh
+```sql
+   ANALYZE users;
 ```
 
-### Q: ポート 15432 が既に使われている
+2. **選択性が低い（該当行が多すぎる）**
 
-`docker-compose.yml` のポート番号を変更：
+   - PostgreSQL が「Seq Scan の方が速い」と判断
+   - 正常な動作
 
-```yaml
-ports:
-  - "15433:5432" # 別のポート番号に変更
+3. **WHERE 句でカラムに演算している**
+
+```sql
+   -- ❌ INDEXが使えない
+   WHERE age + 1 = 30
+
+   -- ✅ INDEXが使える
+   WHERE age = 29
 ```
 
-`scripts/benchmark.sh` も同様に変更：
+### Q2: INDEX 有りの方が遅くなった
 
-```bash
-PGPORT="15433"  # 同じポート番号に変更
-```
+**これは正常です。**
 
-### Q: データ生成に失敗した
+- 該当件数が多い場合（全体の 1%以上）
+- ランダム I/O のオーバーヘッド > Seq Scan の連続 I/O
+- その INDEX は削除して OK
 
-```bash
-# 完全リセット
-docker compose down -v
-docker compose up -d
+### Q3: どのカラムに INDEX を作ればいい？
 
-# ログで確認
-docker compose logs -f postgres
-```
+**優先順位:**
 
-## 💡 次のステップ
+1. **外部キー（JOIN 条件）**
+2. **WHERE 句で頻繁に使うカラム**（高選択性）
+3. **ORDER BY、GROUP BY 頻出カラム**
+4. **ユニーク制約カラム**
 
-1. ✅ 基本的な INDEX の効果を理解
-2. 🔄 複合 INDEX の列順による違いを実験
-3. 🔄 部分 INDEX の活用
-4. 🔄 JSONB 型の INDEX（GIN/GiST インデックス）
-5. 🔄 フルテキスト検索 INDEX
-6. 🔄 パーティショニングとの組み合わせ
-7. 🔄 カバリング INDEX（INCLUDE 句）
-8. 🔄 INDEX Only スキャンの活用
+### Q4: INDEX はいくつまで作っていい？
 
-## 📖 参考資料
+**目安:**
+
+- 1 テーブルあたり **5〜10 個まで**
+- それ以上は INSERT/UPDATE 性能に影響
+- **未使用 INDEX は定期的に削除**
+
+---
+
+## 📚 参考資料
 
 - [PostgreSQL 公式ドキュメント - EXPLAIN](https://www.postgresql.org/docs/current/sql-explain.html)
 - [PostgreSQL 公式ドキュメント - INDEX](https://www.postgresql.org/docs/current/indexes.html)
 - [PostgreSQL 公式ドキュメント - 性能チューニング](https://www.postgresql.org/docs/current/performance-tips.html)
 
 ---
+
+## 🎉 まとめ
+
+このプロジェクトで学んだ知識があれば、**実務での EXPLAIN 分析と INDEX 設計は十分対応可能**です。
+
+**重要なポイント:**
+
+1. EXPLAIN で実行計画を読めること
+2. INDEX は万能ではなく、逆効果になることもある
+3. 選択性（該当件数の割合）が最重要
+4. 実測（EXPLAIN ANALYZE）で効果を必ず確認
 
 Happy Learning! 🎉
